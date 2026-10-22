@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from mcp import types
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
+from mcp.server.transport_security import TransportSecuritySettings
 from mcp.server.models import InitializationOptions
 from mcp.server.lowlevel import NotificationOptions
 
@@ -323,7 +324,10 @@ async def call_tool(name: str, arguments: dict | None) -> list[types.TextContent
 
 # ── SSE transport ─────────────────────────────────────────────────────────────
 
-sse_transport = SseServerTransport("/messages/")
+sse_transport = SseServerTransport(
+    "/messages/",
+    security_settings=TransportSecuritySettings(enable_dns_rebinding_protection=False),
+)
 
 
 async def sse_endpoint(request: Request):
