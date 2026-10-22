@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import json
 import httpx
@@ -26,8 +27,12 @@ SERVER_URL = os.environ.get("SERVER_URL", "https://bitrix24-mcp-1.onrender.com")
 
 REDIRECT_URI = f"{SERVER_URL}/callback"
 
-# Token available to MCP tools via contextvar
+# Token available to MCP tools via contextvar (set on every POST /messages/ request)
 _BITRIX_TOKEN: ContextVar[str] = ContextVar("bitrix_token", default="")
+
+# Maps MCP session_id (hex UUID) → Bitrix24 access token
+# Populated when SSE connection is opened, read on every POST /messages/
+_SESSION_TOKENS: dict[str, str] = {}
 
 
 # ── Upstash Redis ─────────────────────────────────────────────────────────────
@@ -135,29 +140,68 @@ async def _get_valid_token(sid: str) -> str | None:
         return None
 
 
-# ── ASGI middleware: sets _BITRIX_TOKEN before SSE handler runs ───────────────
+# ── ASGI middleware ───────────────────────────────────────────────────────────
+# MCP SDK (mcp 2.x) captures the POST /messages/ request context via
+# ContextSendStream and restores it when the tool handler runs.
+# So we must set _BITRIX_TOKEN on every POST /messages/ call, not just on /sse.
+#
+# Flow:
+#   GET  /sse  → validate Bearer → wrap send to capture MCP session_id from
+#                the "endpoint" SSE event → store session_id→token
+#   POST /messages/?session_id=X → look up token → set _BITRIX_TOKEN in
+#                current context (gets captured by ContextSendStream.send())
 
 class TokenMiddleware:
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] == "http" and scope.get("path", "").rstrip("/") == "/sse":
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        path = scope.get("path", "")
+
+        if path.rstrip("/") == "/sse":
             headers = {k.lower(): v for k, v in scope.get("headers", [])}
             auth = headers.get(b"authorization", b"").decode()
-            if auth.startswith("Bearer "):
-                sid = auth[7:].strip()
-                token = await _get_valid_token(sid)
-                if not token:
-                    response = PlainTextResponse("Unauthorized", status_code=401)
-                    await response(scope, receive, send)
-                    return
-                _BITRIX_TOKEN.set(token)
-            else:
-                response = PlainTextResponse("Unauthorized", status_code=401)
-                await response(scope, receive, send)
+            if not auth.startswith("Bearer "):
+                await PlainTextResponse("Unauthorized", status_code=401)(scope, receive, send)
                 return
-        await self.app(scope, receive, send)
+            sid = auth[7:].strip()
+            token = await _get_valid_token(sid)
+            if not token:
+                await PlainTextResponse("Unauthorized", status_code=401)(scope, receive, send)
+                return
+
+            # Intercept SSE response to capture the MCP-generated session_id
+            # from the first "data: /messages/?session_id=<hex>" event body.
+            _pending_token = token
+
+            async def capturing_send(message):
+                if message.get("type") == "http.response.body" and _pending_token:
+                    body = message.get("body", b"")
+                    if isinstance(body, bytes):
+                        body = body.decode("utf-8", errors="ignore")
+                    m = re.search(r"session_id=([0-9a-f]+)", body)
+                    if m:
+                        _SESSION_TOKENS[m.group(1)] = _pending_token
+                await send(message)
+
+            await self.app(scope, receive, capturing_send)
+
+        elif "session_id=" in (scope.get("query_string") or b"").decode():
+            # Every POST to /messages/?session_id=X — inject token into context
+            qs = (scope.get("query_string") or b"").decode()
+            m = re.search(r"session_id=([0-9a-f]+)", qs)
+            if m:
+                token = _SESSION_TOKENS.get(m.group(1), "")
+                if token:
+                    _BITRIX_TOKEN.set(token)
+            await self.app(scope, receive, send)
+
+        else:
+            await self.app(scope, receive, send)
 
 
 # ── MCP server ────────────────────────────────────────────────────────────────
